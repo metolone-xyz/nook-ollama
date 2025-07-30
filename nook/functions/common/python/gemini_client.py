@@ -1,17 +1,20 @@
 """
-Gemini API Client for Lambda functions.
+LLM Client for Lambda functions.
 
-This module provides a common interface for interacting with the Gemini API.
+This module provides a common interface for interacting with different LLM APIs including Gemini and Ollama.
 """
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union
 
 from google import genai
 from google.genai import types
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
+import ollama
+import subprocess
+import tempfile
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +33,43 @@ class GeminiClientConfig:
     timeout: int = 60000
     use_search: bool = False
 
+    def update(self, **kwargs) -> None:
+        """Update the configuration with the given keyword arguments."""
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                raise ValueError(f"Invalid configuration key: {key}")
+
+
+@dataclass
+class OllamaClientConfig:
+    """Configuration for the Ollama client."""
+
+    model: str = "bakeneko-2025-3-17:latest"  # 日本語対応モデルをデフォルトに
+    temperature: float = 0.8
+    top_p: float = 0.9
+    max_tokens: int = 8192
+    host: str = "http://localhost:11434"
+    
+    def update(self, **kwargs) -> None:
+        """Update the configuration with the given keyword arguments."""
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                raise ValueError(f"Invalid configuration key: {key}")
+
+
+@dataclass
+class PlamoClientConfig:
+    """Configuration for the Plamo client."""
+
+    model: str = "plamo-translate"  # 実際にはCLIツールを使用
+    from_lang: str = "English"  # デフォルトは英語
+    to_lang: str = "Japanese"  # デフォルトは日本語
+    precision: str = "4bit"  # 4bit, 8bit, bf16
+    
     def update(self, **kwargs) -> None:
         """Update the configuration with the given keyword arguments."""
         for key, value in kwargs.items():
@@ -68,7 +108,9 @@ class GeminiClient:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=4, max=60),
-        retry=retry_if_exception(lambda e: isinstance(e, ClientError)),  # ClientErrorを条件に
+        retry=retry_if_exception(
+            lambda e: isinstance(e, (ClientError, ServerError))
+        ),
         before_sleep=lambda retry_state: logger.info(f"Retrying due to {retry_state.outcome.exception()}...")
     )
     def generate_content(
@@ -270,7 +312,29 @@ class GeminiClient:
         ]
 
 
-def create_client(config: dict[str, Any] | None = None, **kwargs) -> GeminiClient:
+def create_client(config: dict[str, Any] | None = None, **kwargs):
+    """
+    Create a client with the given configuration.
+    
+    The client type is determined by the LLM_PROVIDER environment variable.
+    If not set, defaults to "ollama".
+
+    Parameters
+    ----------
+    config : dict[str, Any] | None
+        Configuration for the client.
+        If not provided, default values will be used.
+
+    Returns
+    -------
+    Union[GeminiClient, OllamaClient]
+        The appropriate client based on the LLM_PROVIDER environment variable.
+    """
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    return create_unified_client(provider, config, **kwargs)
+
+
+def create_gemini_client(config: dict[str, Any] | None = None, **kwargs) -> GeminiClient:
     """
     Create a Gemini client with the given configuration.
 
@@ -300,3 +364,300 @@ def create_client(config: dict[str, Any] | None = None, **kwargs) -> GeminiClien
         client_config = None
 
     return GeminiClient(client_config, **kwargs)
+
+
+class OllamaClient:
+    """Client for interacting with Ollama."""
+
+    def __init__(self, config: OllamaClientConfig | None = None, **kwargs):
+        """
+        Initialize the Ollama client.
+
+        Parameters
+        ----------
+        config : OllamaClientConfig | None
+            Configuration for the Ollama client.
+            If not provided, default values will be used.
+        """
+        self._config = config or OllamaClientConfig()
+        self._config.update(**kwargs)
+        
+        # Initialize Ollama client
+        self._client = ollama.Client(host=self._config.host)
+
+    def generate_content(
+        self,
+        contents: str | list[str],
+        system_instruction: str | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        **kwargs
+    ) -> str:
+        """
+        Generate content using Ollama.
+
+        Parameters
+        ----------
+        contents : str | list[str]
+            The content to generate from.
+        system_instruction : str | None
+            The system instruction to use.
+        model : str | None
+            The model to use.
+            If not provided, the model from the config will be used.
+        temperature : float | None
+            The temperature to use.
+            If not provided, the temperature from the config will be used.
+        top_p : float | None
+            The top_p to use.
+            If not provided, the top_p from the config will be used.
+        max_tokens : int | None
+            The max_tokens to use.
+            If not provided, the max_tokens from the config will be used.
+
+        Returns
+        -------
+        str
+            The generated content.
+        """
+        if isinstance(contents, list):
+            contents = "\n".join(contents)
+
+        # Prepare messages
+        messages = []
+        if system_instruction:
+            messages.append({
+                "role": "system",
+                "content": system_instruction
+            })
+        
+        messages.append({
+            "role": "user", 
+            "content": contents
+        })
+
+        # Prepare options
+        options = {
+            "temperature": temperature or self._config.temperature,
+            "top_p": top_p or self._config.top_p,
+            "num_predict": max_tokens or self._config.max_tokens,
+        }
+
+        try:
+            response = self._client.chat(
+                model=model or self._config.model,
+                messages=messages,
+                options=options
+            )
+            
+            return response['message']['content']
+            
+        except Exception as e:
+            logger.error(f"Error generating content with Ollama: {e}")
+            raise
+
+    def create_chat(self, **kwargs):
+        """Create a new chat session. (Not implemented for Ollama)"""
+        raise NotImplementedError("Chat sessions are not implemented for Ollama client.")
+
+    def send_message(self, message: str) -> str:
+        """Send a message to the chat. (Not implemented for Ollama)"""
+        raise NotImplementedError("Chat sessions are not implemented for Ollama client.")
+
+    def chat_with_search(self, message: str, model: str | None = None) -> str:
+        """Chat with search capability. (Not implemented for Ollama)"""
+        raise NotImplementedError("Search capability is not implemented for Ollama client.")
+
+
+def create_ollama_client(config: dict[str, Any] | None = None, **kwargs) -> OllamaClient:
+    """
+    Create an Ollama client with the given configuration.
+
+    Parameters
+    ----------
+    config : dict[str, Any] | None
+        Configuration for the Ollama client.
+        If not provided, default values will be used.
+
+    Returns
+    -------
+    OllamaClient
+        The Ollama client.
+    """
+    if config:
+        client_config = OllamaClientConfig(
+            model=config.get("model", "bakeneko-2025-3-17:latest"),
+            temperature=config.get("temperature", 0.8),
+            top_p=config.get("top_p", 0.9),
+            max_tokens=config.get("max_tokens", 8192),
+            host=config.get("host", "http://localhost:11434"),
+        )
+    else:
+        client_config = None
+
+    return OllamaClient(client_config, **kwargs)
+
+
+class PlamoClient:
+    """Client for interacting with Plamo translation model."""
+
+    def __init__(self, config: PlamoClientConfig | None = None, **kwargs):
+        """
+        Initialize the Plamo client.
+
+        Parameters
+        ----------
+        config : PlamoClientConfig | None
+            Configuration for the Plamo client.
+            If not provided, default values will be used.
+        """
+        self._config = config or PlamoClientConfig()
+        self._config.update(**kwargs)
+
+    def generate_content(
+        self,
+        contents: str | list[str],
+        system_instruction: str | None = None,
+        model: str | None = None,
+        **kwargs
+    ) -> str:
+        """
+        Generate content using Plamo translation.
+
+        For translation tasks, this method will attempt to translate the content.
+        For general text generation, it will process the content through translation.
+
+        Parameters
+        ----------
+        contents : str | list[str]
+            The content to translate or process.
+        system_instruction : str | None
+            Instructions for the translation (e.g., "Translate to English").
+            If provided, will attempt to parse target language.
+        model : str | None
+            Not used for Plamo (always uses plamo-translate).
+        **kwargs
+            Additional arguments (not used for Plamo).
+
+        Returns
+        -------
+        str
+            The translated or processed content.
+        """
+        if isinstance(contents, list):
+            contents = "\n".join(contents)
+
+        # Parse target language from system instruction if provided
+        to_lang = self._config.to_lang
+        from_lang = self._config.from_lang
+        
+        if system_instruction:
+            # Simple parsing for common translation instructions
+            instruction_lower = system_instruction.lower()
+            if "english" in instruction_lower or "英語" in instruction_lower:
+                to_lang = "English"
+            elif "japanese" in instruction_lower or "日本語" in instruction_lower:
+                to_lang = "Japanese"
+            elif "chinese" in instruction_lower or "中国語" in instruction_lower:
+                to_lang = "Chinese"
+            elif "korean" in instruction_lower or "韓国語" in instruction_lower:
+                to_lang = "Korean"
+
+        try:
+            # Use plamo-translate CLI via subprocess
+            cmd = [
+                "plamo-translate",
+                "--from", from_lang,
+                "--to", to_lang,
+                "--precision", self._config.precision,
+                "--input", contents
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60  # 60秒のタイムアウト
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"Plamo translation failed: {result.stderr}")
+                raise RuntimeError(f"Plamo translation failed: {result.stderr}")
+            
+            return result.stdout.strip()
+            
+        except subprocess.TimeoutExpired:
+            logger.error("Plamo translation timed out")
+            raise RuntimeError("Plamo translation timed out")
+        except Exception as e:
+            logger.error(f"Error running plamo-translate: {e}")
+            raise
+
+    def create_chat(self, **kwargs):
+        """Create a new chat session. (Not implemented for Plamo)"""
+        raise NotImplementedError("Chat sessions are not implemented for Plamo client.")
+
+    def send_message(self, message: str) -> str:
+        """Send a message to the chat. (Not implemented for Plamo)"""
+        raise NotImplementedError("Chat sessions are not implemented for Plamo client.")
+
+    def chat_with_search(self, message: str, model: str | None = None) -> str:
+        """Chat with search capability. (Not implemented for Plamo)"""
+        raise NotImplementedError("Search capability is not implemented for Plamo client.")
+
+
+def create_plamo_client(config: dict[str, Any] | None = None, **kwargs) -> PlamoClient:
+    """
+    Create a Plamo client with the given configuration.
+
+    Parameters
+    ----------
+    config : dict[str, Any] | None
+        Configuration for the Plamo client.
+        If not provided, default values will be used.
+
+    Returns
+    -------
+    PlamoClient
+        The Plamo client.
+    """
+    if config:
+        client_config = PlamoClientConfig(
+            model=config.get("model", "plamo-translate"),
+            from_lang=config.get("from_lang", "English"),
+            to_lang=config.get("to_lang", "Japanese"),
+            precision=config.get("precision", "4bit"),
+        )
+    else:
+        client_config = None
+
+    return PlamoClient(client_config, **kwargs)
+
+
+def create_unified_client(provider: str = "ollama", config: dict[str, Any] | None = None, **kwargs):
+    """
+    Create a unified client that can switch between different LLM providers.
+
+    Parameters
+    ----------
+    provider : str
+        The provider to use ("gemini", "ollama", or "plamo").
+    config : dict[str, Any] | None
+        Configuration for the client.
+        If not provided, default values will be used.
+
+    Returns
+    -------
+    Union[GeminiClient, OllamaClient, PlamoClient]
+        The appropriate client based on the provider.
+    """
+    if provider.lower() == "gemini":
+        return create_gemini_client(config, **kwargs)
+    elif provider.lower() == "ollama":
+        return create_ollama_client(config, **kwargs)
+    elif provider.lower() == "plamo":
+        return create_plamo_client(config, **kwargs)
+    else:
+        raise ValueError(f"Unknown provider: {provider}. Supported providers are 'gemini', 'ollama', and 'plamo'.")

@@ -9,7 +9,12 @@ from typing import Any
 
 import feedparser
 import requests
-import tomllib
+import sys
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 from bs4 import BeautifulSoup
 from ..common.python.gemini_client import create_client
 

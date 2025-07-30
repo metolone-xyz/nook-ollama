@@ -10,3 +10,8 @@ arxiv
 praw==7.7.1
 feedparser==6.0.10
 regex==2023.12.25
+tomli==2.0.1
+fastapi==0.104.1
+jinja2==3.1.2
+uvicorn==0.24.0
+ollama==0.4.7

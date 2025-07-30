@@ -5,7 +5,12 @@ from datetime import date
 from typing import Any, Literal
 
 import praw
-import tomllib
+import sys
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 from ..common.python.gemini_client import create_client
 
 _MARKDOWN_FORMAT = """
