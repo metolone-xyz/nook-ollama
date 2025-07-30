@@ -46,7 +46,7 @@ class GeminiClientConfig:
 class OllamaClientConfig:
     """Configuration for the Ollama client."""
 
-    model: str = "bakeneko-2025-3-17:latest"  # 日本語対応モデルをデフォルトに
+    model: str = "huggingface.co/rinna/qwen2.5-bakeneko-32b-instruct-gguf:latest"  # 日本語対応モデルをデフォルトに
     temperature: float = 0.8
     top_p: float = 0.9
     max_tokens: int = 8192
